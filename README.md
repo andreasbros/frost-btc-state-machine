@@ -1,2 +1,6 @@
 # frost-btc-state-machine
-FROST Signing State Machine for Bitcoin
+
+## Development environment setup
+
+1. `rustup update stable`
+2. `rustup component add rustfmt clippy`

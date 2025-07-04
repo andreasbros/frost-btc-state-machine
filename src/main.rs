@@ -1,7 +1,7 @@
-use std::path::PathBuf;
 use anyhow::Error;
 use clap::{Parser, Subcommand};
 use frost_demo::{generate_keys, spend};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "frost-demo", about = "FROST BTC Taproot threshold signing demo")]
@@ -16,11 +16,11 @@ enum Commands {
     Keygen {
         /// Threshold number of signers.
         #[arg(long)]
-        threshold: usize,
+        threshold: u16,
 
         /// Total number of parties.
         #[arg(long)]
-        parties: usize,
+        parties: u16,
 
         /// Output file for key shares (JSON).
         #[arg(long)]
@@ -49,13 +49,13 @@ async fn main() -> Result<(), Error> {
 
     match &cli.command {
         Commands::Keygen { threshold, parties, output } => {
-            println!("Generating {} of {} threshold keys...", threshold, parties);
+            println!("Generating {threshold} of {parties} threshold keys...");
             generate_keys(*threshold, *parties, output.as_path()).await?;
-            println!("Keys saved to {:?}", output);
+            println!("Keys saved to {output:?}");
         }
 
         Commands::Spend { keys, to, amount } => {
-            println!("Spending {} sats to {}...", amount, to);
+            println!("Spending {amount} sats to {to}...");
             spend(keys, to, *amount).await?;
             println!("Signed transaction (hex): ...");
         }

@@ -1,4 +1,4 @@
-# frost-btc-state-machine
+# 
 
 ## Development environment setup
 

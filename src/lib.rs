@@ -65,6 +65,7 @@ pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<
 
     let mut file = File::create(output).await.context("Failed to create output file")?;
     file.write_all(&json_bytes).await?;
+    file.flush().await.context("Failed to flush data to file")?;
 
     Ok(())
 }

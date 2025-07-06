@@ -1,4 +1,4 @@
-use bitcoin::{Address, Network, OutPoint};
+use bitcoin::{Address, Amount, Network, OutPoint, TxOut};
 use frost_demo::{
     bitcoin::{create_spend_transaction, KeyData},
     generate_keys,
@@ -36,17 +36,13 @@ async fn test_full_signing_ceremony() {
     let keys_json = fs::read_to_string(keys_path).await.unwrap();
     let key_data: KeyData = serde_json::from_str(&keys_json).unwrap();
 
-    // Dummy transaction data
+    // transaction data
     let outpoint = OutPoint::from_str("f2ba6014dd5598a2333b7d1553c932f7a9d7a22b704481da4a10fb0032e35f4b:0")
         .expect("Failed to parse outpoint");
-
-    // Signet address ???
     let to_address = Address::from_str("tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7")
         .expect("Failed to parse address");
-
     let amount = 10000;
 
-    // Signet address ???
     let transaction = create_spend_transaction(
         outpoint,
         to_address.require_network(Network::Signet).expect("Address network mismatch"),
@@ -54,7 +50,13 @@ async fn test_full_signing_ceremony() {
     )
     .expect("Failed to create transaction");
 
-    let result = run_signing_ceremony(key_data, transaction).await;
+    // previous output for a valid sighash
+    let prevout_amount = 50000;
+    let group_address = key_data.address(Network::Signet).expect("Failed to get group address");
+    let prevout_txout = TxOut { value: Amount::from_sat(prevout_amount), script_pubkey: group_address.script_pubkey() };
+    let prevouts = &[prevout_txout];
+
+    let result = run_signing_ceremony(key_data, transaction, prevouts).await;
     assert!(result.is_ok(), "Signing ceremony failed: {:?}", result.err());
     println!("Signed transaction: {}", result.unwrap());
 }

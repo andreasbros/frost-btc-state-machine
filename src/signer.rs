@@ -3,7 +3,7 @@ use crate::{
     errors::SigningError,
     transport::{InMemoryTransport, Transport},
 };
-use bitcoin::Transaction;
+use bitcoin::{Transaction, TxOut};
 use frost_secp256k1_tr as frost;
 use frost_secp256k1_tr::{
     round1::{SigningCommitments, SigningNonces},
@@ -115,7 +115,11 @@ impl FrostSigner {
 }
 
 /// coordinator for the FROST signing ceremony.
-pub async fn run_signing_ceremony(key_data: KeyData, mut transaction: Transaction) -> Result<String, SigningError> {
+pub async fn run_signing_ceremony(
+    key_data: KeyData,
+    mut tx: Transaction,
+    prev_tx_outs: &[TxOut],
+) -> Result<String, SigningError> {
     let key_packages_by_identifier: BTreeMap<Identifier, _> = key_data
         .key_packages
         .into_iter()
@@ -136,7 +140,7 @@ pub async fn run_signing_ceremony(key_data: KeyData, mut transaction: Transactio
 
     // Round 1: All participants generate nonces and broadcast commitments.
     for (id, signer) in signers.iter_mut() {
-        let signer_nonces = signer.initiate_signing(session_id, transaction.clone()).await?;
+        let signer_nonces = signer.initiate_signing(session_id, tx.clone()).await?;
         nonces.insert(*id, signer_nonces);
     }
 
@@ -159,7 +163,7 @@ pub async fn run_signing_ceremony(key_data: KeyData, mut transaction: Transactio
         return Err(SigningError::NotEnoughSigners);
     }
 
-    let sighash_message = compute_sighash(&mut transaction, key_data.public.verifying_key())?;
+    let sighash_message = compute_sighash(&mut tx, prev_tx_outs)?;
     let signing_package = frost::SigningPackage::new(all_commitments, sighash_message.as_ref());
 
     // Round 2: Each participant creates and broadcasts their signature share.
@@ -179,7 +183,7 @@ pub async fn run_signing_ceremony(key_data: KeyData, mut transaction: Transactio
     let group_signature = frost::aggregate(&signing_package, &all_shares, &key_data.public)?;
 
     // Finalize transaction.
-    let final_tx_hex = aggregate_and_finalize_tx(&mut transaction, &group_signature)?;
+    let final_tx_hex = aggregate_and_finalize_tx(&mut tx, &group_signature)?;
 
     Ok(final_tx_hex)
 }

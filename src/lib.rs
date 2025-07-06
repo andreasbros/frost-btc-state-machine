@@ -9,6 +9,7 @@ use crate::{
 };
 use ::bitcoin::{Address, Network, OutPoint, Txid};
 use anyhow::{Context, Error};
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use frost::keys::{generate_with_dealer, IdentifierList, KeyPackage};
 use frost_secp256k1_tr as frost;
 use frost_secp256k1_tr::Identifier;
@@ -76,22 +77,69 @@ pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<
     Ok(())
 }
 
-pub async fn spend(keys_path: &Path, utxo: &str, to: &str, amount: u64) -> Result<String, Error> {
-    let keys_json = tokio::fs::read_to_string(keys_path).await.context("Failed to read keys file")?;
+/// Spend arguments.
+pub struct SpendArgs<'a> {
+    /// JSON file containing threshold key shares.
+    pub keys_path: &'a Path,
 
+    /// UTXO to spend from (txid:vout).
+    pub utxo: &'a str,
+
+    /// Destination address to send funds to.
+    pub to: &'a str,
+
+    /// Amount in satoshis to send.
+    pub amount: u64,
+
+    /// Bitcoin network to use.
+    pub network: Network,
+
+    /// URL of the Bitcoin Core RPC server.
+    pub rpc_url: &'a str,
+
+    /// RPC username for authentication (optional).
+    pub rpc_user: Option<&'a str>,
+
+    /// RPC password for authentication (optional).
+    pub rpc_pass: Option<&'a str>,
+}
+
+/// Connects to a node, constructs, signs, and broadcasts a transaction.
+pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
+    let keys_json = tokio::fs::read_to_string(args.keys_path).await.context("Failed to read keys file")?;
     let key_data: KeyData = serde_json::from_str(&keys_json).context("Failed to parse keys JSON")?;
 
-    let (txid_str, vout_str) = utxo.split_once(':').context("Invalid UTXO format. Expected txid:vout")?;
+    let (txid_str, vout_str) = args.utxo.split_once(':').context("Invalid UTXO format. Expected txid:vout")?;
     let txid = Txid::from_str(txid_str).context("Invalid txid")?;
     let vout = vout_str.parse::<u32>().context("Invalid vout")?;
     let outpoint = OutPoint { txid, vout };
 
-    let destination_address = Address::from_str(to)?.require_network(Network::Signet)?;
+    let destination_address = Address::from_str(args.to)?.require_network(args.network)?;
 
-    let transaction = create_spend_transaction(outpoint, destination_address, amount)?;
+    let auth = match (args.rpc_user, args.rpc_pass) {
+        (Some(user), Some(pass)) => Auth::UserPass(user.to_string(), pass.to_string()),
+        _ => Auth::None,
+    };
+    let rpc = Client::new(args.rpc_url, auth).context("Failed to create RPC client")?;
+
+    println!("Fetching previous transaction details from the node...");
+    let prev_tx =
+        rpc.get_raw_transaction(&outpoint.txid, None).context("Failed to fetch previous transaction from node")?;
+    let prevout_txout = prev_tx
+        .output
+        .get(outpoint.vout as usize)
+        .cloned()
+        .context("Vout index out of bounds for the previous transaction")?;
+    let prevouts = &[prevout_txout];
+
+    let transaction = create_spend_transaction(outpoint, destination_address, args.amount)?;
 
     println!("Starting FROST signing ceremony...");
-    let signed_tx = run_signing_ceremony(key_data, transaction).await?;
+    let signed_tx_hex = run_signing_ceremony(key_data, transaction, prevouts).await?;
 
-    Ok(signed_tx)
+    println!("Broadcasting signed transaction to the network...");
+    let final_txid =
+        rpc.send_raw_transaction(signed_tx_hex.as_str()).context("Failed to broadcast the final transaction")?;
+
+    Ok(final_txid)
 }

@@ -66,27 +66,10 @@ pub fn create_spend_transaction(
 }
 
 /// Compute signature hash for segwit / taproot inputs.
-pub fn compute_sighash(
-    transaction: &mut Transaction,
-    verifying_key: &frost::VerifyingKey,
-) -> Result<Message, BitcoinError> {
-    let secp = Secp256k1::new();
-
-    let verifying_key_bytes = verifying_key.serialize().map_err(|e| BitcoinError::Sighash(e.to_string()))?;
-    let bitcoin_public_key =
-        PublicKey::from_slice(&verifying_key_bytes).map_err(|e| BitcoinError::Sighash(e.to_string()))?;
-
-    let (internal_key, _parity) = bitcoin_public_key.inner.x_only_public_key();
-
-    // TODO: We need the full previous transaction output. Replace with actual UTXO details for a real transaction.
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(0), // dummy value
-        script_pubkey: Address::p2tr(&secp, internal_key, None, Network::Signet).script_pubkey(),
-    }];
-
-    let mut sighasher = SighashCache::new(transaction);
+pub fn compute_sighash(tx: &mut Transaction, prev_tx_outs: &[TxOut]) -> Result<Message, BitcoinError> {
+    let mut sighasher = SighashCache::new(tx);
     let sighash = sighasher
-        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), sighash::TapSighashType::Default)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(prev_tx_outs), sighash::TapSighashType::Default)
         .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
 
     Ok(Message::from(sighash))
@@ -94,7 +77,7 @@ pub fn compute_sighash(
 
 /// Finalise transaction
 pub fn aggregate_and_finalize_tx(
-    transaction: &mut Transaction,
+    tx: &mut Transaction,
     aggregated_signature: &Signature,
 ) -> Result<String, BitcoinError> {
     // Serialise the signature into the correct 64B format for a Taproot keypath spend.
@@ -103,7 +86,7 @@ pub fn aggregate_and_finalize_tx(
 
     let mut witness = Witness::new();
     witness.push(sig_bytes);
-    transaction.input[0].witness = witness;
+    tx.input[0].witness = witness;
 
-    Ok(bitcoin::consensus::encode::serialize_hex(transaction))
+    Ok(bitcoin::consensus::encode::serialize_hex(tx))
 }

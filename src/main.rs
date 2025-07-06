@@ -33,6 +33,10 @@ enum Commands {
         #[arg(long)]
         keys: PathBuf,
 
+        /// UTXO to spend from (txid:vout).
+        #[arg(long)]
+        utxo: String,
+
         /// Destination address to send funds to.
         #[arg(long)]
         to: String,
@@ -54,9 +58,9 @@ async fn main() -> Result<(), Error> {
             println!("Keys saved to {output:?}");
         }
 
-        Commands::Spend { keys, to, amount } => {
+        Commands::Spend { keys, utxo, to, amount } => {
             println!("Spending {amount} sats to {to}...");
-            spend(keys, to, *amount).await?;
+            spend(keys, utxo, to, *amount).await?;
             println!("Signed transaction (hex): ...");
         }
     }

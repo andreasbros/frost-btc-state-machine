@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
-bitcoin = "0.32"
+bitcoin = { version = "0.32", features = ["serde"] }
 frost-secp256k1-tr = { version = "2.1", features = ["serde"] }
 tokio = { version = "1.46", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
 clap = { version = "4.5", features = ["derive"] }

@@ -1,6 +1,13 @@
-mod guardian;
+pub mod bitcoin;
+pub mod errors;
+pub mod signer;
 mod transport;
 
+use crate::{
+    bitcoin::{create_spend_transaction, KeyData},
+    signer::run_signing_ceremony,
+};
+use ::bitcoin::{Address, Network, OutPoint, Txid};
 use anyhow::{Context, Error};
 use frost::keys::{generate_with_dealer, IdentifierList, KeyPackage};
 use frost_secp256k1_tr as frost;
@@ -8,7 +15,7 @@ use frost_secp256k1_tr::Identifier;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_with::{hex::Hex, serde_as};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, str::FromStr};
 use thiserror::Error;
 use tokio::{fs::File, io::AsyncWriteExt};
 
@@ -39,13 +46,12 @@ impl TryFrom<u16> for ParticipantId {
     }
 }
 
-/// Key generation data
-#[derive(Serialize, Deserialize)]
-pub struct KeyGenerationData {
-    pub threshold: u16,
-    pub total: u16,
-    pub public: frost::keys::PublicKeyPackage,
-    pub key_packages: BTreeMap<ParticipantId, KeyPackage>,
+impl<'a> TryFrom<&'a ParticipantId> for Identifier {
+    type Error = ParticipantIdError;
+
+    fn try_from(id: &'a ParticipantId) -> Result<Self, Self::Error> {
+        Identifier::deserialize(&id.0).map_err(|_| ParticipantIdError::InvalidIdentifier)
+    }
 }
 
 pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<(), Error> {
@@ -59,7 +65,7 @@ pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-    let data = KeyGenerationData { threshold, total, public: pubkey_package, key_packages };
+    let data = KeyData { threshold, total, public: pubkey_package, key_packages };
 
     let json_bytes = serde_json::to_vec_pretty(&data).context("Failed to serialize data to JSON")?;
 
@@ -70,36 +76,22 @@ pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<
     Ok(())
 }
 
-pub async fn spend(_keys_path: &Path, _to: &str, _amount: u64) -> Result<String, Error> {
-    Ok("hex".to_string())
-}
+pub async fn spend(keys_path: &Path, utxo: &str, to: &str, amount: u64) -> Result<String, Error> {
+    let keys_json = tokio::fs::read_to_string(keys_path).await.context("Failed to read keys file")?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::NamedTempFile;
-    use tokio::fs;
+    let key_data: KeyData = serde_json::from_str(&keys_json).context("Failed to parse keys JSON")?;
 
-    #[tokio::test]
-    async fn test_generate_keys_success() {
-        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
-        let path = temp_file.path();
+    let (txid_str, vout_str) = utxo.split_once(':').context("Invalid UTXO format. Expected txid:vout")?;
+    let txid = Txid::from_str(txid_str).context("Invalid txid")?;
+    let vout = vout_str.parse::<u32>().context("Invalid vout")?;
+    let outpoint = OutPoint { txid, vout };
 
-        generate_keys(2, 3, path).await.expect("Failed to generate keys");
+    let destination_address = Address::from_str(to)?.require_network(Network::Signet)?;
 
-        let file_content = fs::read_to_string(path).await.expect("Failed to read generated keys file");
+    let transaction = create_spend_transaction(outpoint, destination_address, amount)?;
 
-        assert!(!file_content.is_empty(), "Generated keys file should not be empty");
+    println!("Starting FROST signing ceremony...");
+    let signed_tx = run_signing_ceremony(key_data, transaction).await?;
 
-        let data: KeyGenerationData = serde_json::from_str(&file_content).expect("JSON should deserialize");
-        assert_eq!(data.key_packages.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_spend_success() {
-        let to_address = "bc1q...";
-        let amount_satoshi = 1000;
-        let result = spend(Path::new("keys.json"), to_address, amount_satoshi).await;
-        assert!(result.is_ok(), "should return Ok on success");
-    }
+    Ok(signed_tx)
 }

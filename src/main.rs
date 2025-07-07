@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use frost_demo::{bitcoin::KeyData, generate_keys, spend, SpendArgs};
 use std::path::PathBuf;
 
-/// The default public RPC endpoint for the Bitcoin.
+/// The default public RPC endpoint for the Bitcoin (https://signet-rpc.publicnode.com, https://bitcoin-testnet-rpc.publicnode.com)
 const DEFAULT_BITCOIN_CORE_RPC_URL: &str = "https://bitcoin-testnet-rpc.publicnode.com";
 
 #[derive(Parser)]

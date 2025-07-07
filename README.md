@@ -18,7 +18,7 @@ The application orchestrates the entire lifecycle of a threshold signature trans
     without revealing their individual key shares.
 
 3.  **Live Bitcoin Network Interaction**: Connect to a Bitcoin node 
-    (a local `regtest` node for development or a public `testnet` node) to fetch the necessary 
+    (a local `regtest` node for development or a public `signet` node) to fetch the necessary 
     UTXO data for signing and to broadcast the final, signed transaction to the network.
 
 
@@ -29,7 +29,7 @@ The application orchestrates the entire lifecycle of a threshold signature trans
 
 ## Running Demo
 
-### Step 1: Generate Your Threshold Keys
+### Step 1: Generate threshold keys
 
 First, you need to create the set of key shares for your signing group. This command will create 
 a 2-of-3 setup, meaning you have 3 participants, and any 2 of them are required to sign a 
@@ -41,8 +41,33 @@ Run the following command in your terminal:
 cargo run -p frost-demo -- keygen --threshold 2 --parties 3 --output keys.json
 ```
 
-This will create a keys.json file in your project directory. This file contains the public group 
-key and the private shares for each of the three participants.
+### Step 2: Fund group address
+
+Use the `fund` command to derive and display the address for the network you want to use (`signet`).
+
+Run the following command to derive group address:
+
+```shell
+cargo run -p frost-demo -- fund --keys keys.json --network signet
+```
+
+Fund the group address using one of Bitcoin Faucets: 
+- Signet: https://signetfaucet.com/
+- Testnet: https://bitcoinfaucet.uo1.net/
+
+Block Explorer:
+- Signet: https://mempool.space/signet/address/tb1pcz79yn5gkngl7mqygqhjcd250xsdl3crrgnnfy9g4uplxsceedsqlmvsga
+- Testnet: https://mempool.space/testnet/address/tb1pcz79yn5gkngl7mqygqhjcd250xsdl3crrgnnfy9g4uplxsceedsqlmvsga
+
+### Step 3: Spend from group address
+
+Use the `spend` command to send funds from group address to some other address (e.g. `tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq`).
+
+```shell
+cargo run -p frost-demo -- spend --keys keys.json --network testnet --utxo "bb989ef9f19b3393cac1aff4ca4161753010fb789e0193b07788b7baf9ea2bc2:1" --to "tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq" --amount 1000
+```
+
+and check block explorer to find your spend tx: https://mempool.space/signet/address/tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq
 
 ## Testing
 
@@ -57,4 +82,4 @@ key and the private shares for each of the three participants.
         ```
    2. Run your spend command pointing to it:
 
-2. Validate and stage on `testnet`
+2. Validate and stage on `sigtest`

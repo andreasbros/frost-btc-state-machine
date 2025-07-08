@@ -1,8 +1,10 @@
 use anyhow::{Context, Error};
 use bitcoin::Network;
 use clap::{Parser, Subcommand, ValueEnum};
-use frost_demo::{bitcoin::KeyData, generate_keys, spend, SpendArgs};
+use frost_demo::{generate_keys, keys::KeyData, spend, SpendArgs};
 use std::path::PathBuf;
+use tracing::info;
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
 /// The default public RPC endpoint for the Bitcoin (https://signet-rpc.publicnode.com, https://bitcoin-testnet-rpc.publicnode.com)
 const DEFAULT_BITCOIN_CORE_RPC_URL: &str = "https://bitcoin-testnet-rpc.publicnode.com";
@@ -97,7 +99,6 @@ enum CliNetwork {
     Regtest,
 }
 
-/// Implement a conversion from our local CLI enum to the `bitcoin::Network` enum.
 impl From<CliNetwork> for Network {
     fn from(network: CliNetwork) -> Self {
         match network {
@@ -110,15 +111,26 @@ impl From<CliNetwork> for Network {
     }
 }
 
+// Setup metrics recorder to export metrics to Prometheus
+fn setup_metrics_recorder() {
+    let _ =
+        metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder().context("failed to install recorder");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    let filter = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy();
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).without_time().init();
+
+    setup_metrics_recorder();
+
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::Keygen { threshold, parties, output } => {
-            println!("Generating {threshold} of {parties} threshold keys...");
+            info!("Generating {threshold} of {parties} threshold keys...");
             generate_keys(*threshold, *parties, output.as_path()).await?;
-            println!("Keys saved to {output:?}");
+            info!("Keys saved to {output:?}");
         }
 
         Commands::GroupAddress { keys, network } => {
@@ -129,11 +141,11 @@ async fn main() -> Result<(), Error> {
 
             let address = key_data.address(btc_network).context("Failed to derive address from key data")?;
 
-            println!("Group address for '{btc_network}': {address}");
+            info!("Group address for '{btc_network}': {address}");
         }
 
         Commands::Spend { keys, utxo, to, amount, network, rpc_url, rpc_user, rpc_pass } => {
-            println!("Spending {amount} sats to {to} on the {network:?} network...");
+            info!("Spending {amount} sats to {to} on the {network:?} network...");
 
             let args = SpendArgs {
                 keys_path: keys,
@@ -147,8 +159,8 @@ async fn main() -> Result<(), Error> {
             };
             let tx_id = spend(args).await?;
 
-            println!("Transaction signed and broadcasted!");
-            println!("TxID: {tx_id}");
+            info!("Transaction signed and broadcasted!");
+            info!("TxID: {tx_id}");
         }
     }
 

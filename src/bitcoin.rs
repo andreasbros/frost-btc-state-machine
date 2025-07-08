@@ -1,107 +1,52 @@
-use crate::{errors::BitcoinError, ParticipantId};
-use bitcoin::{absolute::LockTime, address::Address, secp256k1::{Message, Secp256k1}, sighash::{self, Prevouts, SighashCache}, transaction::Transaction, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-use frost_secp256k1_tr::{
-    self as frost,
-    keys::{KeyPackage, PublicKeyPackage},
-    Ciphersuite, Signature,
+use crate::errors::BitcoinError;
+use bitcoin::{
+    absolute::LockTime,
+    address::Address,
+    secp256k1::Message,
+    sighash::{self, Prevouts, SighashCache},
+    transaction::Transaction,
+    Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use bitcoin::key::{TapTweak, UntweakedPublicKey};
-use k256::elliptic_curve::point::AffineCoordinates;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use bitcoincore_rpc::{Auth, Client, RpcApi};
+use frost_secp256k1_tr::{self as frost, Ciphersuite, Signature};
+use std::str::FromStr;
+use tracing::{debug, warn};
 
 const DEFAULT_FEE: u64 = 500;
 const DUST_P2TR: u64 = 330;
 
-/// Key generation data
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct KeyData {
-    pub threshold: u16,
-    pub total: u16,
-    pub public: PublicKeyPackage,
-    pub key_packages: BTreeMap<ParticipantId, KeyPackage>,
-}
-
-impl KeyData {
-    /// Derive bitcoin group address for a given network: Bitcoin, Testnet, Testnet4, Signet, Regtest
-    pub fn address(&self, network: Network) -> Result<Address, BitcoinError> {
-        let secp_engine = Secp256k1::new();
-
-        // g the FROST group verifying key.
-        let group_verifying_key = self.public.verifying_key();
-        let mut affine_point = group_verifying_key.to_element().to_affine();
-
-        // for a taproo keypath spend, the internal public key must have an even
-        // y coordinate. If it's odd, we must use its negation?
-        if affine_point.y_is_odd().into() {
-            affine_point = -affine_point;
-        }
-
-        // serialize the potential internal key to a compressed public key format
-        let pk_bytes = affine_point.to_encoded_point(true);
-        let bitcoin_public_key = PublicKey::from_slice(pk_bytes.as_bytes())
-            .map_err(|e| BitcoinError::Address(e.to_string()))?;
-
-        // get the x only public key from the inner secp256k1 key
-        let (x_only_pk, _parity) = bitcoin_public_key.inner.x_only_public_key();
-        let untweaked_pk = UntweakedPublicKey::from(x_only_pk);
-
-        // tweak the key for a key-path-only spend as per BIP-341.
-        // the output key Q = P + H(P)G. The bitcoin library handles this.
-        // We pass None for the merkle root.
-        let (tweaked_pk, _tweak_parity) = untweaked_pk.tap_tweak(&secp_engine, None);
-        
-        // create the P2TR address from the final, tweaked internal key.
-        let address = Address::p2tr(&secp_engine, untweaked_pk, None, network);
-        Ok(address)
-    }
-}
-
 /// Create spend transaction
-pub fn create_spend_transaction(
+pub fn create_unsiged_transaction(
     utxo: OutPoint,
-    utxo_value_sat: u64,
+    utxo_to_spend: &TxOut,
     to_addr: Address,
-    pay_amount_sat: u64,
+    pay_amount_sat: Amount,
     change_addr: Address,
 ) -> Result<Transaction, BitcoinError> {
-    
-    if pay_amount_sat + DEFAULT_FEE > utxo_value_sat {
+    let fee = Amount::from_sat(DEFAULT_FEE);
+    let dust = Amount::from_sat(DUST_P2TR);
+    let total_value = utxo_to_spend.value;
+    if pay_amount_sat + fee > total_value {
         return Err(BitcoinError::Spend(format!(
-            "amount ({pay_amount_sat}) + fee ({DEFAULT_FEE}) exceeds utxo value ({utxo_value_sat})"
+            "amount ({pay_amount_sat}) + fee ({DEFAULT_FEE}) exceeds utxo value ({total_value})"
         )));
     }
 
-    let tx_in = TxIn {
-        previous_output: utxo,
-        script_sig: ScriptBuf::new(),
-        sequence: Sequence::MAX,
-        witness: Witness::new(),
-    };
+    let tx_in =
+        TxIn { previous_output: utxo, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() };
 
-    // first output - real payment
-    let pay_out = TxOut {
-        value: Amount::from_sat(pay_amount_sat),
-        script_pubkey: to_addr.script_pubkey(),
-    };
+    let pay_out = TxOut { value: pay_amount_sat, script_pubkey: to_addr.script_pubkey() };
 
-    // change (if any)
-    let change_value = utxo_value_sat - pay_amount_sat - DEFAULT_FEE;
+    let change_value = total_value - pay_amount_sat - fee;
     let mut outputs = vec![pay_out];
 
-    if change_value >= DUST_P2TR {
-        outputs.push(TxOut {
-            value: Amount::from_sat(change_value),
-            script_pubkey: change_addr.script_pubkey(),
-        });
+    if change_value >= dust {
+        outputs.push(TxOut { value: change_value, script_pubkey: change_addr.script_pubkey() });
     } else {
-        // otherwise we deliberately leave the remainder as an extra fee
-        println!(
-            "change ({change_value} sat) below dust – adding it to the fee instead"
-        );
+        // deliberately leave the remainder as an extra fee
+        warn!("change ({change_value} sat) below dust – adding it to the fee instead");
     }
-    
+
     Ok(Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -134,4 +79,41 @@ pub fn aggregate_and_finalize_tx(
     tx.input[0].witness = witness;
 
     Ok(tx.clone())
+}
+
+/// Creates a new RPC client for communicating with the Bitcoin node.
+pub fn create_rpc_client(url: &str, user: Option<&str>, pass: Option<&str>) -> Result<Client, BitcoinError> {
+    debug!("Creating Bitcoin client...");
+    let auth = match (user, pass) {
+        (Some(user), Some(pass)) => Auth::UserPass(user.to_string(), pass.to_string()),
+        _ => Auth::None,
+    };
+    Client::new(url, auth).map_err(|e| BitcoinError::Utxo(e.to_string()))
+}
+
+/// Parses a UTXO string of the format "txid:vout" into an OutPoint.
+pub fn parse_utxo(utxo_str: &str) -> Result<OutPoint, BitcoinError> {
+    let (txid_str, vout_str) = utxo_str
+        .split_once(':')
+        .ok_or_else(|| BitcoinError::Utxo("Invalid UTXO format. Expected txid:vout".to_string()))?;
+    let txid = Txid::from_str(txid_str).map_err(|_| BitcoinError::Utxo("Invalid txid".to_string()))?;
+    let vout = vout_str.parse::<u32>().map_err(|_| BitcoinError::Utxo("Invalid vout".to_string()))?;
+    Ok(OutPoint { txid, vout })
+}
+
+/// Fetches the specific transaction output (TxOut) we intend to spend.
+pub fn fetch_utxo_to_spend(rpc_client: &Client, outpoint: &OutPoint) -> Result<TxOut, BitcoinError> {
+    let prev_tx =
+        rpc_client.get_raw_transaction(&outpoint.txid, None).map_err(|e| BitcoinError::Client(e.to_string()))?;
+
+    prev_tx
+        .output
+        .get(outpoint.vout as usize)
+        .cloned()
+        .ok_or_else(|| BitcoinError::Utxo("Vout index out of bounds for the previous transaction".to_string()))
+}
+
+/// Broadcasts the signed transaction to the Bitcoin network.
+pub fn broadcast_transaction(rpc_client: &Client, signed_tx: &bitcoin::Transaction) -> Result<Txid, BitcoinError> {
+    rpc_client.send_raw_transaction(signed_tx).map_err(|e| BitcoinError::Client(e.to_string()))
 }

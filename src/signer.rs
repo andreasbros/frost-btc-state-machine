@@ -1,10 +1,15 @@
-use crate::{bitcoin::{aggregate_and_finalize_tx, compute_sighash, KeyData}, errors::SigningError, transport::{InMemoryTransport, Transport}, ParticipantId};
-use bitcoin::{secp256k1, secp256k1::Secp256k1, Network, PublicKey as BtcPk, TapTweakHash, Transaction, TxOut};
+use crate::{
+    bitcoin::compute_sighash,
+    errors::SigningError,
+    keys::KeyData,
+    transport::{InMemoryTransport, Transport},
+};
+use bitcoin::{Transaction, TxOut};
 use frost_secp256k1_tr as frost;
-use frost_secp256k1_tr::{round1::{SigningCommitments, SigningNonces}, round2::SignatureShare, Ciphersuite, Identifier, SigningPackage};
-use k256::{
-    Scalar,
-    elliptic_curve::{bigint::U256, ops::Reduce},
+use frost_secp256k1_tr::{
+    round1::{SigningCommitments, SigningNonces},
+    round2::SignatureShare,
+    Ciphersuite, Identifier, SigningPackage,
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -13,11 +18,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use bitcoin::key::{TapTweak, UntweakedPublicKey};
-use k256::elliptic_curve::bigint::Encoding;
-use k256::elliptic_curve::point::AffineCoordinates;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use frost_secp256k1_tr::keys::Tweak;
+use tokio::time::timeout;
+use tracing::{debug, info, instrument, warn};
 
 pub type SessionId = u64;
 
@@ -67,197 +69,224 @@ impl FrostSigner {
         Self { participant_id, key_package, state: SigningState::Idle, transport }
     }
 
-    /// Initiates round 1 of the signing ceremony:
-    /// - coordinator should provide a unique session ID for the ceremony.
-    /// - this function returns the secret nonces which must be stored by the coordinator and used in round 2.
-    pub async fn initiate_signing(
+    #[instrument(skip(self, transaction), fields(participant_id = ?self.participant_id))]
+    pub async fn initiate_signing_round(
         &mut self,
         session_id: SessionId,
         transaction: Transaction,
     ) -> Result<SigningNonces, SigningError> {
         if !matches!(self.state, SigningState::Idle) {
-            return Err(SigningError::InvalidState("Not in Idle state to initiate signing".to_string()));
+            return Err(SigningError::InvalidState("Signer is not in Idle state.".to_string()));
         }
 
         let deadline = Instant::now() + Duration::from_secs(60);
-
         self.state =
             SigningState::CollectingCommitments { session_id, transaction, commitments: BTreeMap::new(), deadline };
 
         let (nonces, commitments) = frost::round1::commit(self.key_package.signing_share(), &mut OsRng);
 
+        debug!("Broadcasting nonce commitment.");
         let msg = SigningMessage::NonceCommitment(session_id, self.participant_id, Box::new(commitments));
         self.transport.broadcast(msg).await?;
 
         Ok(nonces)
     }
 
+    #[instrument(skip(self, msg), fields(participant_id = ?self.participant_id))]
     pub async fn process_message(&mut self, msg: SigningMessage) -> Result<(), SigningError> {
         match &mut self.state {
             SigningState::CollectingCommitments { session_id, commitments, .. } => {
                 if let SigningMessage::NonceCommitment(msg_session_id, sender, new_commitments) = msg {
                     if msg_session_id == *session_id {
+                        debug!(from = ?sender, "Received nonce commitment.");
                         commitments.insert(sender, *new_commitments);
+
+                        metrics::counter!("frost_messages_processed_total", "type" => "nonce_commitment").increment(1);
                     }
                 }
             }
             SigningState::CollectingShares { session_id, shares, .. } => {
                 if let SigningMessage::SignatureShare(msg_session_id, sender, share) = msg {
                     if msg_session_id == *session_id {
-                        // TODO: verify shares as they arrive.
+                        // TODO: need to verify received signature shares are valid to fail early and prevent certain attacks.
+                        debug!(from = ?sender, "Received signature share.");
                         shares.insert(sender, share);
+
+                        metrics::counter!("frost_messages_processed_total", "type" => "signature_share").increment(1);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                warn!("Received message in unexpected state.");
+            }
         }
         Ok(())
     }
 }
 
-/// TODO: introduce logging and metrics!
-fn dbg_hex(tag: &str, bytes: &[u8]) { println!("{tag}: {}", hex::encode(bytes)); }
-
-/// Run a verbose FROST Taproot signing ceremony with diagnostics...
+/// A coordinator function to perform a FROST signing ceremony for a Taproot input.
+#[instrument(skip_all, fields(session_id))]
 pub async fn run_signing_ceremony(
     key_data: KeyData,
-    mut tx: Transaction,
+    mut transaction: Transaction,
     prev_tx_outs: &[TxOut],
 ) -> Result<Transaction, SigningError> {
-    // map <ParticipantId to KeyPackage> transport
-    let key_pkgs: BTreeMap<Identifier, _> = key_data.clone()
-        .key_packages
-        .into_iter()
-        .map(|(pid, kp)| Identifier::try_from(&pid)
-            .map(|id| (id, kp))
-            .map_err(|e| SigningError::InternalError(e.to_string())))
-        .collect::<Result<_, _>>()?;
-
-    let transport = Arc::new(InMemoryTransport::new(key_pkgs.keys().copied().collect()));
-    let mut signers: HashMap<_, _> = key_pkgs
-        .into_iter()
-        .map(|(id, kp)| (id, FrostSigner::new(id, kp, transport.clone())))
-        .collect();
-
-    // TapTweak diagnostics (raw hash fed to FROST)
-    let secp   = Secp256k1::verification_only();
-    let p_bytes = key_data.public.verifying_key().to_element().to_affine()
-        .to_encoded_point(true);
-    dbg_hex("P(compressed)", p_bytes.as_bytes());
-
-    let (px, _) = bitcoin::PublicKey::from_slice(p_bytes.as_bytes())
-        .unwrap()
-        .inner
-        .x_only_public_key();
-    dbg_hex("Px", &px.serialize());
-
-    let h = TapTweakHash::from_key_and_tweak(px, None);
-    dbg_hex("h = H_TapTweak(Px)", h.as_ref());
-
-    // purely diagnostic:
-    let t_be: [u8; 32] =
-        <Scalar as Reduce<U256>>::reduce(U256::from_be_slice(h.as_ref()))
-            .to_bytes()
-            .into();
-    dbg_hex("t (big-endian, diagnostic only)", &t_be);
-
-    let q_xonly = UntweakedPublicKey::from(px).tap_tweak(&secp, None).0.to_inner();
-    dbg_hex("Q (library)", &q_xonly.serialize());
-
-    let script_pk = key_data.address(Network::Signet)?.script_pubkey();
-    let q_addr = match script_pk.as_bytes() {
-        [0x51, 32, rest @ ..] => rest,
-        _ => return Err(SigningError::InternalError("unexpected script".into())),
-    };
-    dbg_hex("Q (address)", q_addr);
-    if q_addr != q_xonly.serialize() {
-        return Err(SigningError::InternalError("Tweaked key mismatch!".into()));
-    }
-
-    // round-1 commitments
     let session_id = rand::random::<SessionId>();
-    let mut nonces = BTreeMap::new();
-    for (id, s) in signers.iter_mut() {
-        nonces.insert(*id, s.initiate_signing(session_id, tx.clone()).await?);
-    }
-    while let Ok(Some((_to, m))) = transport.receive().await {
-        for s in signers.values_mut() { s.process_message(m.clone()).await?; }
-    }
-    let commitments = signers.values().find_map(|s| {
-        if let SigningState::CollectingCommitments { commitments, .. } = &s.state {
-            Some(commitments.clone())
-        } else { None }
-    }).unwrap();
+    tracing::Span::current().record("session_id", session_id);
+
+    info!("Starting signing ceremony.");
+
+    let (mut signers, transport) = setup_signers(&key_data)?;
+
+    // Round 1: All participants generate and broadcast commitments.
+    let nonces = perform_round_one(&mut signers, session_id, transaction.clone()).await?;
+
+    // Collect all broadcasted commitments.
+    let commitments = collect_commitments(&transport, &mut signers).await?;
     if commitments.len() < key_data.threshold as usize {
         return Err(SigningError::NotEnoughSigners);
     }
 
-    // signing package (BIP-341 msg)
-    let sighash = compute_sighash(&mut tx, prev_tx_outs)?;
-    dbg_hex("BIP-341 Msg", sighash.as_ref());
-    let pkg = SigningPackage::new(commitments, sighash.as_ref());
+    // Create the signing package containing the message to be signed.
+    let signing_package = create_signing_package(&mut transaction, prev_tx_outs, commitments)?;
 
-    // ── 4. round-2 shares (crate computes tweak internally) ────────
+    // Round 2: Participants generate and broadcast signature shares.
+    let shares = perform_round_two(&signers, &nonces, &signing_package)?;
+
+    // Aggregate the shares into a final signature.
+    let group_signature = frost::aggregate_with_tweak(&signing_package, &shares, &key_data.public, None)?;
+    let signature_bytes = frost::Secp256K1Sha256TR::serialize_signature(&group_signature)?;
+    debug!(aggregated_signature = %hex::encode(&signature_bytes), "Signature aggregation successful.");
+
+    // Finalize the transaction by adding the witness.
+    transaction.input[0].witness.push(signature_bytes);
+    info!("Signing ceremony complete, transaction is finalized.");
+
+    Ok(transaction)
+}
+
+/// Initializes the signers and the transport layer for communication.
+fn setup_signers(
+    key_data: &KeyData,
+) -> Result<(HashMap<Identifier, FrostSigner>, Arc<InMemoryTransport>), SigningError> {
+    let identifiers = key_data.key_packages.keys().cloned().collect();
+
+    let transport = Arc::new(InMemoryTransport::new(identifiers));
+
+    let signers: HashMap<_, _> = key_data
+        .key_packages
+        .iter()
+        .map(|(identifier, key_package)| {
+            let signer = FrostSigner::new(*identifier, key_package.clone(), transport.clone());
+            (*identifier, signer)
+        })
+        .collect();
+
+    Ok((signers, transport))
+}
+
+/// Executes Round 1 of the signing protocol for all participants.
+async fn perform_round_one(
+    signers: &mut HashMap<Identifier, FrostSigner>,
+    session_id: SessionId,
+    transaction: Transaction,
+) -> Result<BTreeMap<Identifier, SigningNonces>, SigningError> {
+    info!("Initiating Round 1: Generating and broadcasting commitments.");
+    let mut nonces = BTreeMap::new();
+    for (id, signer) in signers.iter_mut() {
+        let signer_nonces = signer.initiate_signing_round(session_id, transaction.clone()).await?;
+        nonces.insert(*id, signer_nonces);
+    }
+    Ok(nonces)
+}
+
+/// Waits for and processes messages to collect commitments.
+async fn collect_commitments(
+    transport: &Arc<InMemoryTransport>,
+    signers: &mut HashMap<Identifier, FrostSigner>,
+) -> Result<BTreeMap<Identifier, SigningCommitments>, SigningError> {
+    info!("Collecting nonce commitments from all participants.");
+
+    // Get the deadline that was set during round one.
+    let deadline = signers
+        .values()
+        .find_map(|s| match &s.state {
+            SigningState::CollectingCommitments { deadline, .. } => Some(*deadline),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            SigningError::InvalidState("Cannot collect commitments: signers are not in the correct state.".to_string())
+        })?;
+
+    // Loop until the messages are empty or the deadline is reached.
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(SigningError::Timeout("Timed out while waiting for nonce commitments.".to_string()));
+        }
+        let remaining_time = deadline - now;
+
+        match timeout(remaining_time, transport.receive()).await {
+            Err(_) => {
+                warn!("Timed out waiting for a commitment from a participant.");
+                return Err(SigningError::Timeout("Timed out while waiting for nonce commitments.".to_string()));
+            }
+            Ok(receive_result) => match receive_result {
+                Ok(Some((_recipient, message))) => {
+                    for signer in signers.values_mut() {
+                        signer.process_message(message.clone()).await?;
+                    }
+                }
+                // The transport channel was closed gracefully, meaning no more messages.
+                Ok(None) => {
+                    info!("Transport channel closed. Proceeding with collected commitments.");
+                    break;
+                }
+                // The transport returned an error.
+                Err(e) => {
+                    warn!(error = ?e, "Error receiving from transport. Breaking collection loop.");
+                    break;
+                }
+            },
+        }
+    }
+
+    // Extract and return the collected commitments from any signer's state.
+    signers
+        .values()
+        .find_map(|s| match &s.state {
+            SigningState::CollectingCommitments { commitments, .. } => Some(commitments.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| SigningError::InternalError("Could not retrieve commitments.".to_string()))
+}
+
+/// Creates the signing package, which includes the message to be signed (sighash).
+fn create_signing_package(
+    transaction: &mut Transaction,
+    prev_tx_outs: &[TxOut],
+    commitments: BTreeMap<Identifier, SigningCommitments>,
+) -> Result<SigningPackage, SigningError> {
+    let sighash = compute_sighash(transaction, prev_tx_outs)?;
+    debug!(
+        sighash = %hex::encode(sighash.as_ref()),
+        "Computed BIP-341 message digest for signing package."
+    );
+    Ok(SigningPackage::new(commitments, sighash.as_ref()))
+}
+
+/// Executes Round 2 of the signing protocol for all participants.
+fn perform_round_two(
+    signers: &HashMap<Identifier, FrostSigner>,
+    nonces: &BTreeMap<Identifier, SigningNonces>,
+    signing_package: &SigningPackage,
+) -> Result<BTreeMap<Identifier, SignatureShare>, SigningError> {
+    info!("Initiating Round 2: Generating signature shares.");
     let mut shares = BTreeMap::new();
-    for s in signers.values() {
-        let n = &nonces[&s.participant_id];
-        let sh = frost::round2::sign_with_tweak(&pkg, n, &s.key_package, None)?;
-        dbg_hex(&format!("share({:?})", s.participant_id), &sh.serialize());
-        shares.insert(s.participant_id, sh);
+    for signer in signers.values() {
+        let nonce = &nonces[&signer.participant_id];
+        let share = frost::round2::sign_with_tweak(signing_package, nonce, &signer.key_package, None)?;
+        shares.insert(signer.participant_id, share);
     }
-
-    // aggregate + verify
-    let grp_sig = frost::aggregate_with_tweak(&pkg, &shares,
-                                              &key_data.public, None)?;
-    let mut sig_bytes = frost::Secp256K1Sha256TR::serialize_signature(&grp_sig)?;
-    dbg_hex("Aggregated Sig (raw)", &sig_bytes);
-
-    // verify each share against its own crate-tweaked key
-    for (id, sh) in &shares {
-        let pid = ParticipantId::from(*id);
-        let tweaked_kp =
-            key_data.key_packages[&pid].clone().tweak::<&[u8]>(None);   // ← type annotated
-        let elem = tweaked_kp.verifying_share().to_element();
-        let (px_s, _) =
-            bitcoin::PublicKey::from_slice(elem.to_encoded_point(true).as_bytes())
-                .unwrap()
-                .inner
-                .x_only_public_key();
-        let q_i = UntweakedPublicKey::from(px_s).tap_tweak(&secp, None).0.to_inner();
-
-        let mut sig64 = [0u8; 64];
-        sig64[..32].copy_from_slice(&sig_bytes[..32]);
-        sig64[32..].copy_from_slice(&sh.serialize());
-        let ok = secp.verify_schnorr(
-            &secp256k1::schnorr::Signature::from_slice(&sig64).unwrap(),
-            &secp256k1::Message::from_slice(sighash.as_ref()).unwrap(),
-            &q_i,
-        ).is_ok();
-        println!("### share verify {id:?} ok={ok}");
-    }
-
-    // verify aggregate
-    let msg = secp256k1::Message::from_slice(sighash.as_ref()).unwrap();
-    let mut sig = secp256k1::schnorr::Signature::from_slice(&sig_bytes).unwrap();
-    let mut ok = secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok();
-    println!("verify attempt 1 ok={ok}");
-    if !ok {
-        let n = U256::from_be_hex(
-            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
-        let (_, s_part) = sig_bytes.split_at_mut(32);
-        let s_fix = n.wrapping_sub(&U256::from_be_slice(s_part)).to_be_bytes();
-        s_part.copy_from_slice(&s_fix);
-        sig = secp256k1::schnorr::Signature::from_slice(&sig_bytes).unwrap();
-        ok = secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok();
-        println!("verify attempt 2 (n-s) ok={ok}");
-    }
-    if !ok {
-        return Err(SigningError::InternalError("libsecp verify failed".into()));
-    }
-    dbg_hex("Aggregated Sig (final)", &sig_bytes);
-    println!("libsecp verification succeeded");
-
-    // final witness
-    tx.input[0].witness.push(sig_bytes.to_vec());
-    Ok(tx)
+    Ok(shares)
 }

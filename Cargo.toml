@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 bitcoin = { version = "0.32.6", features = ["serde"] }
-bitcoincore-rpc = { version = "0.19" }
+bitcoincore-rpc = { git = "https://github.com/andreasbros/rust-bitcoincore-rpc.git", rev = "4a31697258bb4aa06f103bc2cc89daff94994f4e" }
 frost-secp256k1-tr = { version = "2.1", features = ["serde"] }
+k256 = { version = "0.13.4", features = ["arithmetic"] }
 tokio = { version = "1.46", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
 clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
@@ -18,6 +19,7 @@ serde_with = { version = "3.14", features = ["hex"]}
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
 rand = "0.8"
+hex = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3"

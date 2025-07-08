@@ -14,9 +14,12 @@ use frost_secp256k1_tr::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use bitcoin::key::{TapTweak, UntweakedPublicKey};
+use k256::elliptic_curve::point::AffineCoordinates;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 
 /// Key generation data
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct KeyData {
     pub threshold: u16,
     pub total: u16,
@@ -25,17 +28,36 @@ pub struct KeyData {
 }
 
 impl KeyData {
-    /// Bitcoin address for a given network: Bitcoin, Testnet, Testnet4, Signet, Regtest
+    /// Derive bitcoin group address for a given network: Bitcoin, Testnet, Testnet4, Signet, Regtest
     pub fn address(&self, network: Network) -> Result<Address, BitcoinError> {
         let secp_engine = Secp256k1::new();
-        let verifying_key_bytes =
-            self.public.verifying_key().serialize().map_err(|e| BitcoinError::Address(e.to_string()))?;
 
-        let bitcoin_public_key =
-            PublicKey::from_slice(&verifying_key_bytes).map_err(|e| BitcoinError::Address(e.to_string()))?;
+        // g the FROST group verifying key.
+        let group_verifying_key = self.public.verifying_key();
+        let mut affine_point = group_verifying_key.to_element().to_affine();
 
-        let (internal_key, _parity) = bitcoin_public_key.inner.x_only_public_key();
-        let address = Address::p2tr(&secp_engine, internal_key, None, network);
+        // for a taproo keypath spend, the internal public key must have an even
+        // y coordinate. If it's odd, we must use its negation?
+        if affine_point.y_is_odd().into() {
+            affine_point = -affine_point;
+        }
+
+        // serialize the potential internal key to a compressed public key format
+        let pk_bytes = affine_point.to_encoded_point(true);
+        let bitcoin_public_key = PublicKey::from_slice(pk_bytes.as_bytes())
+            .map_err(|e| BitcoinError::Address(e.to_string()))?;
+
+        // get the x only public key from the inner secp256k1 key
+        let (x_only_pk, _parity) = bitcoin_public_key.inner.x_only_public_key();
+        let untweaked_pk = UntweakedPublicKey::from(x_only_pk);
+
+        // tweak the key for a key-path-only spend as per BIP-341.
+        // the output key Q = P + H(P)G. The bitcoin library handles this.
+        // We pass None for the merkle root.
+        let (tweaked_pk, _tweak_parity) = untweaked_pk.tap_tweak(&secp_engine, None);
+        
+        // create the P2TR address from the final, tweaked internal key.
+        let address = Address::p2tr(&secp_engine, untweaked_pk, None, network);
         Ok(address)
     }
 }
@@ -79,7 +101,7 @@ pub fn compute_sighash(tx: &mut Transaction, prev_tx_outs: &[TxOut]) -> Result<M
 pub fn aggregate_and_finalize_tx(
     tx: &mut Transaction,
     aggregated_signature: &Signature,
-) -> Result<String, BitcoinError> {
+) -> Result<Transaction, BitcoinError> {
     // Serialise the signature into the correct 64B format for a Taproot keypath spend.
     let sig_bytes = frost::Secp256K1Sha256TR::serialize_signature(aggregated_signature)
         .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
@@ -88,5 +110,5 @@ pub fn aggregate_and_finalize_tx(
     witness.push(sig_bytes);
     tx.input[0].witness = witness;
 
-    Ok(bitcoin::consensus::encode::serialize_hex(tx))
+    Ok(tx.clone())
 }

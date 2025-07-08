@@ -56,15 +56,15 @@ Fund the group address using one of Bitcoin Faucets:
 - Testnet: https://bitcoinfaucet.uo1.net/
 
 Block Explorer:
-- Signet: https://mempool.space/signet/address/tb1pcz79yn5gkngl7mqygqhjcd250xsdl3crrgnnfy9g4uplxsceedsqlmvsga
-- Testnet: https://mempool.space/testnet/address/tb1pcz79yn5gkngl7mqygqhjcd250xsdl3crrgnnfy9g4uplxsceedsqlmvsga
+- Signet: https://mempool.space/signet/address/tb1pfxu44k5mxv52vw379jkcj9mal7mg2wwreddwr55ugzzsscptlrdsu0tt44
+- Testnet: https://mempool.space/testnet/address/tb1pfxu44k5mxv52vw379jkcj9mal7mg2wwreddwr55ugzzsscptlrdsu0tt44
 
 ### Step 3: Spend from group address
 
-Use the `spend` command to send funds from group address to some other address (e.g. `tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq`).
+Use the `spend` command to send funds from group address to some other address (e.g. `tb1pfxu44k5mxv52vw379jkcj9mal7mg2wwreddwr55ugzzsscptlrdsu0tt44`).
 
 ```shell
-cargo run -p frost-demo -- spend --keys keys.json --network testnet --utxo "bb989ef9f19b3393cac1aff4ca4161753010fb789e0193b07788b7baf9ea2bc2:1" --to "tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq" --amount 1000
+cargo run -p frost-demo -- spend --keys keys.json --network testnet --utxo "1366804a53d06733099536f4d9341830d7d80876fa2f407d5e7c0661bd288faa:0" --to "tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq" --amount 1000
 ```
 
 and check block explorer to find your spend tx: https://mempool.space/signet/address/tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq
@@ -77,9 +77,27 @@ and check block explorer to find your spend tx: https://mempool.space/signet/add
 
    1. Run a local bitcoin node in `regtest` mode:
         ```shell
-        # The -fallbackfee is useful to avoid issues with fee estimation
-        bitcoind -regtest -txindex=1 -fallbackfee=0.0001
+        docker stop regtest-node &> /dev/null; docker rm regtest-node &> /dev/null
+
+        docker run -d --name regtest-node \
+        -v ~/bitcoin-regtest-data:/home/bitcoin/.bitcoin \
+        -p 18443:18443 \
+        ruimarinho/bitcoin-core:0.21.1 \
+        -regtest \
+        -server=1 \
+        -txindex \
+        -rpcbind=0.0.0.0 \
+        -rpcallowip=0.0.0.0/0
         ```
+
+2. Create wallet:
+```shell
+docker exec regtest-node bitcoin-cli -regtest createwallet "mywallet"
+```
+
+3. Generate spendable coins:
+   docker exec regtest-node bitcoin-cli -regtest -generate 101
+      
    2. Run your spend command pointing to it:
 
 2. Validate and stage on `sigtest`

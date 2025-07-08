@@ -120,7 +120,7 @@ pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
         (Some(user), Some(pass)) => Auth::UserPass(user.to_string(), pass.to_string()),
         _ => Auth::None,
     };
-    let rpc = Client::new(args.rpc_url, auth).context("Failed to create RPC client")?;
+    let rpc = Client::new_with_minreq(args.rpc_url, auth).context("Failed to create RPC client")?;
 
     println!("Fetching previous transaction details from the node...");
     let prev_tx =
@@ -135,11 +135,11 @@ pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
     let transaction = create_spend_transaction(outpoint, destination_address, args.amount)?;
 
     println!("Starting FROST signing ceremony...");
-    let signed_tx_hex = run_signing_ceremony(key_data, transaction, prevouts).await?;
+    let signed_tx = run_signing_ceremony(key_data, transaction, prevouts).await?;
 
     println!("Broadcasting signed transaction to the network...");
     let final_txid =
-        rpc.send_raw_transaction(signed_tx_hex.as_str()).context("Failed to broadcast the final transaction")?;
+        rpc.send_raw_transaction(&signed_tx).context("Failed to broadcast the final transaction")?;
 
     Ok(final_txid)
 }

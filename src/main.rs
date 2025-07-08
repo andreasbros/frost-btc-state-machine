@@ -32,7 +32,7 @@ enum Commands {
     },
 
     /// Derives and prints the group address for a given network to be funded.
-    Fund {
+    GroupAddress {
         /// JSON file containing threshold key shares.
         #[arg(long)]
         keys: PathBuf,
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Error> {
             println!("Keys saved to {output:?}");
         }
 
-        Commands::Fund { keys, network } => {
+        Commands::GroupAddress { keys, network } => {
             let btc_network: Network = (*network).into();
 
             let keys_json = std::fs::read_to_string(keys).context("Failed to read keys file")?;

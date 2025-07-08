@@ -1,12 +1,5 @@
 use crate::{errors::BitcoinError, ParticipantId};
-use bitcoin::{
-    absolute::LockTime,
-    address::Address,
-    secp256k1::{Message, Secp256k1},
-    sighash::{self, Prevouts, SighashCache},
-    transaction::Transaction,
-    Amount, Network, OutPoint, PublicKey, ScriptBuf, TxIn, TxOut, Witness,
-};
+use bitcoin::{absolute::LockTime, address::Address, secp256k1::{Message, Secp256k1}, sighash::{self, Prevouts, SighashCache}, transaction::Transaction, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 use frost_secp256k1_tr::{
     self as frost,
     keys::{KeyPackage, PublicKeyPackage},
@@ -17,6 +10,9 @@ use std::collections::BTreeMap;
 use bitcoin::key::{TapTweak, UntweakedPublicKey};
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+const DEFAULT_FEE: u64 = 500;
+const DUST_P2TR: u64 = 330;
 
 /// Key generation data
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -65,26 +61,53 @@ impl KeyData {
 /// Create spend transaction
 pub fn create_spend_transaction(
     utxo: OutPoint,
-    to_address: Address,
-    amount_sats: u64,
+    utxo_value_sat: u64,
+    to_addr: Address,
+    pay_amount_sat: u64,
+    change_addr: Address,
 ) -> Result<Transaction, BitcoinError> {
+    
+    if pay_amount_sat + DEFAULT_FEE > utxo_value_sat {
+        return Err(BitcoinError::Spend(format!(
+            "amount ({pay_amount_sat}) + fee ({DEFAULT_FEE}) exceeds utxo value ({utxo_value_sat})"
+        )));
+    }
+
     let tx_in = TxIn {
         previous_output: utxo,
         script_sig: ScriptBuf::new(),
-        sequence: bitcoin::Sequence::MAX,
+        sequence: Sequence::MAX,
         witness: Witness::new(),
     };
 
-    let tx_out = TxOut { value: Amount::from_sat(amount_sats), script_pubkey: to_address.script_pubkey() };
+    // first output - real payment
+    let pay_out = TxOut {
+        value: Amount::from_sat(pay_amount_sat),
+        script_pubkey: to_addr.script_pubkey(),
+    };
 
-    let transaction = Transaction {
+    // change (if any)
+    let change_value = utxo_value_sat - pay_amount_sat - DEFAULT_FEE;
+    let mut outputs = vec![pay_out];
+
+    if change_value >= DUST_P2TR {
+        outputs.push(TxOut {
+            value: Amount::from_sat(change_value),
+            script_pubkey: change_addr.script_pubkey(),
+        });
+    } else {
+        // otherwise we deliberately leave the remainder as an extra fee
+        println!(
+            "change ({change_value} sat) below dust – adding it to the fee instead"
+        );
+    }
+    
+    Ok(Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![tx_in],
-        output: vec![tx_out],
-    };
-
-    Ok(transaction)
+        output: outputs,
+    })
 }
 
 /// Compute signature hash for segwit / taproot inputs.

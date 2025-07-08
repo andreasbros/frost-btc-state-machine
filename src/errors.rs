@@ -33,4 +33,6 @@ pub enum BitcoinError {
     Sighash(String),
     #[error("Bitcoin address error: {0}")]
     Address(String),
+    #[error("Bitcoin spend error: {0}")]
+    Spend(String),
 }

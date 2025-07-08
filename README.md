@@ -43,21 +43,19 @@ cargo run -p frost-demo -- keygen --threshold 2 --parties 3 --output keys.json
 
 ### Step 2: Fund group address
 
-Use the `fund` command to derive and display the address for the network you want to use (`signet`).
+Use the `group-address` command to derive and display the address for the network you want to use (`testnet`).
 
-Run the following command to derive group address:
+Run the following command to multisig group address:
 
 ```shell
-cargo run -p frost-demo -- fund --keys keys.json --network signet
+cargo run -p frost-demo -- group-address --keys keys.json --network testnet
 ```
 
-Fund the group address using one of Bitcoin Faucets: 
-- Signet: https://signetfaucet.com/
-- Testnet: https://bitcoinfaucet.uo1.net/
+Fund the group address using one of Bitcoin Faucets:
+- Testnet: https://bitcoinfaucet.uo1.net/, https://coinfaucet.eu/en/btc-testnet/
 
 Block Explorer:
-- Signet: https://mempool.space/signet/address/tb1pfxu44k5mxv52vw379jkcj9mal7mg2wwreddwr55ugzzsscptlrdsu0tt44
-- Testnet: https://mempool.space/testnet/address/tb1pfxu44k5mxv52vw379jkcj9mal7mg2wwreddwr55ugzzsscptlrdsu0tt44
+- Testnet: https://mempool.space/testnet/address/tb1py0wg4a969ary6zugut7dw4jrtvkm09avmrkuh49l02pms3dak26qwx5j06
 
 ### Step 3: Spend from group address
 
@@ -67,7 +65,7 @@ Use the `spend` command to send funds from group address to some other address (
 cargo run -p frost-demo -- spend --keys keys.json --network testnet --utxo "1366804a53d06733099536f4d9341830d7d80876fa2f407d5e7c0661bd288faa:0" --to "tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq" --amount 1000
 ```
 
-and check block explorer to find your spend tx: https://mempool.space/signet/address/tb1pxaymxlg6kus0kfj6fs42t5306jjnxteam99x2jyyjf7qwen7qjjseqxpcq
+and check block explorer to find your spend tx
 
 ## Testing
 

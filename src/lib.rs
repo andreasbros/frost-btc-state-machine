@@ -130,9 +130,16 @@ pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
         .get(outpoint.vout as usize)
         .cloned()
         .context("Vout index out of bounds for the previous transaction")?;
+
+    let utxo_value = prevout_txout.value.to_sat();
+    
+    let change_addr = key_data
+        .address(args.network)
+        .context("deriving group address")?;
+    
     let prevouts = &[prevout_txout];
 
-    let transaction = create_spend_transaction(outpoint, destination_address, args.amount)?;
+    let transaction = create_spend_transaction(outpoint, utxo_value, destination_address, args.amount, change_addr)?;
 
     println!("Starting FROST signing ceremony...");
     let signed_tx = run_signing_ceremony(key_data, transaction, prevouts).await?;

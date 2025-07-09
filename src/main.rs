@@ -129,7 +129,7 @@ async fn main() -> Result<(), Error> {
     match &cli.command {
         Commands::Keygen { threshold, parties, output } => {
             info!("Generating {threshold} of {parties} threshold keys...");
-            generate_keys(*threshold, *parties, output.as_path()).await?;
+            generate_keys(*threshold, *parties, output.as_path(), None).await?;
             info!("Keys saved to {output:?}");
         }
 

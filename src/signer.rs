@@ -6,16 +6,13 @@ use crate::{
 };
 use bitcoin::{Transaction, TxOut};
 use frost_secp256k1_tr as frost;
-use frost_secp256k1_tr::{
-    round1::{SigningCommitments, SigningNonces},
-    round2::SignatureShare,
-    Ciphersuite, Identifier, SigningPackage,
-};
+use frost_secp256k1_tr::{Ciphersuite, Identifier, SigningPackage};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    ops::DerefMut,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::time::timeout;
@@ -23,40 +20,48 @@ use tracing::{debug, info, instrument, warn};
 
 pub type SessionId = u64;
 
+/// Message transmitted between participants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SigningMessage {
-    NonceCommitment(SessionId, Identifier, Box<SigningCommitments>),
-    SignatureShare(SessionId, Identifier, SignatureShare),
+    NonceCommitment(SessionId, Identifier, Box<frost::round1::SigningCommitments>),
+    SignatureShare(SessionId, Identifier, frost::round2::SignatureShare),
 }
 
-#[derive(Debug)]
+/// FROST state machine states
+#[derive(Debug, Clone)]
 pub enum SigningState {
+    /// Idle state
     Idle,
+
+    /// Round 1: All participants generate and broadcast commitments.
     CollectingCommitments {
         session_id: SessionId,
         transaction: Transaction,
-        commitments: BTreeMap<Identifier, SigningCommitments>,
+        commitments: BTreeMap<Identifier, frost::round1::SigningCommitments>,
         deadline: Instant,
     },
+
+    /// Round 2: Participants generate and broadcast signature shares.
     CollectingShares {
         session_id: SessionId,
-        transaction: Transaction,
         signing_package: SigningPackage,
-        shares: BTreeMap<Identifier, SignatureShare>,
+        shares: BTreeMap<Identifier, frost::round2::SignatureShare>,
         deadline: Instant,
     },
-    Complete {
-        signed_transaction: Transaction,
-    },
-    Failed {
-        error: SigningError,
-    },
+
+    /// Finalize the transaction
+    Complete { signed_transaction: Transaction },
+
+    /// Failed state
+    Failed { error: SigningError },
 }
 
+/// FROST Signer
+#[derive(Clone)]
 pub struct FrostSigner {
     pub participant_id: Identifier,
     pub key_package: frost::keys::KeyPackage,
-    state: SigningState,
+    state: Arc<Mutex<SigningState>>,
     transport: Arc<dyn Transport<Msg = SigningMessage>>,
 }
 
@@ -66,24 +71,39 @@ impl FrostSigner {
         key_package: frost::keys::KeyPackage,
         transport: Arc<dyn Transport<Msg = SigningMessage>>,
     ) -> Self {
-        Self { participant_id, key_package, state: SigningState::Idle, transport }
+        Self { participant_id, key_package, state: Arc::new(Mutex::new(SigningState::Idle)), transport }
     }
 
+    pub fn get_state(&self) -> Result<SigningState, SigningError> {
+        self.state
+            .lock()
+            .map_err(|e| SigningError::InternalError(format!("Failed to lock state mutex: {e}")))
+            .map(|s| s.clone())
+    }
+
+    /// Start round 1
     #[instrument(skip(self, transaction), fields(participant_id = ?self.participant_id))]
     pub async fn initiate_signing_round(
-        &mut self,
+        &self,
         session_id: SessionId,
         transaction: Transaction,
-    ) -> Result<SigningNonces, SigningError> {
-        if !matches!(self.state, SigningState::Idle) {
-            return Err(SigningError::InvalidState("Signer is not in Idle state.".to_string()));
-        }
+    ) -> Result<frost::round1::SigningNonces, SigningError> {
+        let (nonces, commitments) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|e| SigningError::InternalError(format!("Failed to lock state mutex: {e}")))?;
 
-        let deadline = Instant::now() + Duration::from_secs(60);
-        self.state =
-            SigningState::CollectingCommitments { session_id, transaction, commitments: BTreeMap::new(), deadline };
+            if !matches!(*state, SigningState::Idle) {
+                return Err(SigningError::InvalidState("Signer is not in Idle state.".to_string()));
+            }
 
-        let (nonces, commitments) = frost::round1::commit(self.key_package.signing_share(), &mut OsRng);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            *state =
+                SigningState::CollectingCommitments { session_id, transaction, commitments: BTreeMap::new(), deadline };
+
+            frost::round1::commit(self.key_package.signing_share(), &mut OsRng)
+        };
 
         debug!("Broadcasting nonce commitment.");
         let msg = SigningMessage::NonceCommitment(session_id, self.participant_id, Box::new(commitments));
@@ -92,16 +112,67 @@ impl FrostSigner {
         Ok(nonces)
     }
 
+    /// Start round 2
+    #[instrument(skip(self, signing_package), fields(participant_id = ?self.participant_id))]
+    pub fn advance_to_sharing_round(&self, signing_package: SigningPackage) -> Result<(), SigningError> {
+        let mut state = self.state.lock().map_err(|e| SigningError::InternalError(e.to_string()))?;
+
+        match state.deref_mut() {
+            SigningState::CollectingCommitments { session_id, .. } => {
+                debug!("Transitioning to CollectingShares state.");
+                *state = SigningState::CollectingShares {
+                    session_id: *session_id,
+                    signing_package,
+                    shares: BTreeMap::new(),
+                    deadline: Instant::now() + Duration::from_secs(60),
+                };
+                Ok(())
+            }
+            s => Err(SigningError::InvalidState(format!("Cannot advance to sharing round from state {s:?}"))),
+        }
+    }
+
+    /// Broadcast signature shares.
+    #[instrument(skip(self, nonces), fields(participant_id = ?self.participant_id))]
+    pub async fn sign_and_broadcast_share(&self, nonces: &frost::round1::SigningNonces) -> Result<(), SigningError> {
+        let (share, session_id) = {
+            let state = self.state.lock().map_err(|e| SigningError::InternalError(e.to_string()))?;
+            match &*state {
+                SigningState::CollectingShares { signing_package, session_id, .. } => {
+                    let share = frost::round2::sign_with_tweak(signing_package, nonces, &self.key_package, None)?;
+                    (share, *session_id)
+                }
+                s => return Err(SigningError::InvalidState(format!("Cannot sign share in state {s:?}"))),
+            }
+        };
+
+        let msg = SigningMessage::SignatureShare(session_id, self.participant_id, share);
+        self.transport.broadcast(msg).await?;
+        Ok(())
+    }
+
+    /// Finalize the transaction
+    #[instrument(skip(self, signed_transaction), fields(participant_id = ?self.participant_id))]
+    pub fn complete_signing(&self, signed_transaction: Transaction) {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, SigningState::CollectingShares { .. }) {
+            warn!("Completing signature from unexpected state.");
+        }
+        *state = SigningState::Complete { signed_transaction };
+    }
+
+    /// Process messages from other participants.
     #[instrument(skip(self, msg), fields(participant_id = ?self.participant_id))]
-    pub async fn process_message(&mut self, msg: SigningMessage) -> Result<(), SigningError> {
-        match &mut self.state {
+    pub async fn process_message(&self, msg: SigningMessage) -> Result<(), SigningError> {
+        let mut state =
+            self.state.lock().map_err(|e| SigningError::InternalError(format!("Failed to lock state mutex: {e}")))?;
+
+        match state.deref_mut() {
             SigningState::CollectingCommitments { session_id, commitments, .. } => {
                 if let SigningMessage::NonceCommitment(msg_session_id, sender, new_commitments) = msg {
                     if msg_session_id == *session_id {
                         debug!(from = ?sender, "Received nonce commitment.");
                         commitments.insert(sender, *new_commitments);
-
-                        metrics::counter!("frost_messages_processed_total", "type" => "nonce_commitment").increment(1);
                     }
                 }
             }
@@ -111,8 +182,6 @@ impl FrostSigner {
                         // TODO: need to verify received signature shares are valid to fail early and prevent certain attacks.
                         debug!(from = ?sender, "Received signature share.");
                         shares.insert(sender, share);
-
-                        metrics::counter!("frost_messages_processed_total", "type" => "signature_share").increment(1);
                     }
                 }
             }
@@ -133,46 +202,53 @@ pub async fn run_signing_ceremony(
 ) -> Result<Transaction, SigningError> {
     let session_id = rand::random::<SessionId>();
     tracing::Span::current().record("session_id", session_id);
-
     info!("Starting signing ceremony.");
 
-    let (mut signers, transport) = setup_signers(&key_data)?;
+    let (signers, transport) = setup_signers(&key_data)?;
 
     // Round 1: All participants generate and broadcast commitments.
-    let nonces = perform_round_one(&mut signers, session_id, transaction.clone()).await?;
-
-    // Collect all broadcasted commitments.
-    let commitments = collect_commitments(&transport, &mut signers).await?;
+    let nonces = perform_round_one(&signers, session_id, transaction.clone()).await?;
+    let commitments = collect_commitments(transport.clone(), &signers).await?;
     if commitments.len() < key_data.threshold as usize {
         return Err(SigningError::NotEnoughSigners);
     }
-
-    // Create the signing package containing the message to be signed.
     let signing_package = create_signing_package(&mut transaction, prev_tx_outs, commitments)?;
 
+    // Transition signers to Round 2
+    for signer in signers.values() {
+        signer.advance_to_sharing_round(signing_package.clone())?;
+    }
+
     // Round 2: Participants generate and broadcast signature shares.
-    let shares = perform_round_two(&signers, &nonces, &signing_package)?;
+    perform_round_two(&signers, &nonces).await?;
+    let shares = collect_shares(transport, &signers).await?;
+    if shares.len() < key_data.threshold as usize {
+        return Err(SigningError::NotEnoughSigners);
+    }
 
     // Aggregate the shares into a final signature.
     let group_signature = frost::aggregate_with_tweak(&signing_package, &shares, &key_data.public, None)?;
     let signature_bytes = frost::Secp256K1Sha256TR::serialize_signature(&group_signature)?;
     debug!(aggregated_signature = %hex::encode(&signature_bytes), "Signature aggregation successful.");
 
-    // Finalize the transaction by adding the witness.
+    // Finalize the transaction
     transaction.input[0].witness.push(signature_bytes);
-    info!("Signing ceremony complete, transaction is finalized.");
 
+    // Transition signers to complete state
+    for signer in signers.values() {
+        signer.complete_signing(transaction.clone());
+    }
+
+    info!("Signing ceremony complete, transaction is finalized.");
     Ok(transaction)
 }
 
 /// Initializes the signers and the transport layer for communication.
-fn setup_signers(
+pub fn setup_signers(
     key_data: &KeyData,
 ) -> Result<(HashMap<Identifier, FrostSigner>, Arc<InMemoryTransport>), SigningError> {
     let identifiers = key_data.key_packages.keys().cloned().collect();
-
     let transport = Arc::new(InMemoryTransport::new(identifiers));
-
     let signers: HashMap<_, _> = key_data
         .key_packages
         .iter()
@@ -181,19 +257,18 @@ fn setup_signers(
             (*identifier, signer)
         })
         .collect();
-
     Ok((signers, transport))
 }
 
 /// Executes Round 1 of the signing protocol for all participants.
 async fn perform_round_one(
-    signers: &mut HashMap<Identifier, FrostSigner>,
+    signers: &HashMap<Identifier, FrostSigner>,
     session_id: SessionId,
     transaction: Transaction,
-) -> Result<BTreeMap<Identifier, SigningNonces>, SigningError> {
+) -> Result<BTreeMap<Identifier, frost::round1::SigningNonces>, SigningError> {
     info!("Initiating Round 1: Generating and broadcasting commitments.");
     let mut nonces = BTreeMap::new();
-    for (id, signer) in signers.iter_mut() {
+    for (id, signer) in signers.iter() {
         let signer_nonces = signer.initiate_signing_round(session_id, transaction.clone()).await?;
         nonces.insert(*id, signer_nonces);
     }
@@ -202,61 +277,50 @@ async fn perform_round_one(
 
 /// Waits for and processes messages to collect commitments.
 async fn collect_commitments(
-    transport: &Arc<InMemoryTransport>,
-    signers: &mut HashMap<Identifier, FrostSigner>,
-) -> Result<BTreeMap<Identifier, SigningCommitments>, SigningError> {
+    transport: Arc<InMemoryTransport>,
+    signers: &HashMap<Identifier, FrostSigner>,
+) -> Result<BTreeMap<Identifier, frost::round1::SigningCommitments>, SigningError> {
     info!("Collecting nonce commitments from all participants.");
 
-    // Get the deadline that was set during round one.
     let deadline = signers
         .values()
-        .find_map(|s| match &s.state {
-            SigningState::CollectingCommitments { deadline, .. } => Some(*deadline),
+        .find_map(|s| match s.get_state().ok()? {
+            SigningState::CollectingCommitments { deadline, .. } => Some(deadline),
             _ => None,
         })
-        .ok_or_else(|| {
-            SigningError::InvalidState("Cannot collect commitments: signers are not in the correct state.".to_string())
-        })?;
+        .ok_or_else(|| SigningError::InvalidState("Signers not in commitment collection state.".to_string()))?;
 
-    // Loop until the messages are empty or the deadline is reached.
+    // Drain the message queue until the deadline is hit or the queue is empty
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
-            return Err(SigningError::Timeout("Timed out while waiting for nonce commitments.".to_string()));
+            break; // Timeout is handled by extracting whatever we have below
         }
         let remaining_time = deadline - now;
 
         match timeout(remaining_time, transport.receive()).await {
-            Err(_) => {
-                warn!("Timed out waiting for a commitment from a participant.");
-                return Err(SigningError::Timeout("Timed out while waiting for nonce commitments.".to_string()));
+            Ok(Ok(Some((_, message)))) => {
+                for signer in signers.values() {
+                    signer.process_message(message.clone()).await?;
+                }
             }
-            Ok(receive_result) => match receive_result {
-                Ok(Some((_recipient, message))) => {
-                    for signer in signers.values_mut() {
-                        signer.process_message(message.clone()).await?;
-                    }
-                }
-                // The transport channel was closed gracefully, meaning no more messages.
-                Ok(None) => {
-                    info!("Transport channel closed. Proceeding with collected commitments.");
-                    break;
-                }
-                // The transport returned an error.
-                Err(e) => {
-                    warn!(error = ?e, "Error receiving from transport. Breaking collection loop.");
-                    break;
-                }
-            },
+            Ok(Ok(None)) | Err(_) => {
+                // Channel closed or timeout, break and process what was received
+                break;
+            }
+            Ok(Err(e)) => return Err(e.into()), // Transport error
         }
     }
 
-    // Extract and return the collected commitments from any signer's state.
+    // Extract the collected commitments from any signer (they should all be in sync)
     signers
         .values()
-        .find_map(|s| match &s.state {
-            SigningState::CollectingCommitments { commitments, .. } => Some(commitments.clone()),
-            _ => None,
+        .find_map(|s| {
+            if let Ok(SigningState::CollectingCommitments { commitments, .. }) = s.get_state() {
+                Some(commitments)
+            } else {
+                None
+            }
         })
         .ok_or_else(|| SigningError::InternalError("Could not retrieve commitments.".to_string()))
 }
@@ -265,7 +329,7 @@ async fn collect_commitments(
 fn create_signing_package(
     transaction: &mut Transaction,
     prev_tx_outs: &[TxOut],
-    commitments: BTreeMap<Identifier, SigningCommitments>,
+    commitments: BTreeMap<Identifier, frost::round1::SigningCommitments>,
 ) -> Result<SigningPackage, SigningError> {
     let sighash = compute_sighash(transaction, prev_tx_outs)?;
     debug!(
@@ -276,17 +340,65 @@ fn create_signing_package(
 }
 
 /// Executes Round 2 of the signing protocol for all participants.
-fn perform_round_two(
+async fn perform_round_two(
     signers: &HashMap<Identifier, FrostSigner>,
-    nonces: &BTreeMap<Identifier, SigningNonces>,
-    signing_package: &SigningPackage,
-) -> Result<BTreeMap<Identifier, SignatureShare>, SigningError> {
-    info!("Initiating Round 2: Generating signature shares.");
-    let mut shares = BTreeMap::new();
+    nonces: &BTreeMap<Identifier, frost::round1::SigningNonces>,
+) -> Result<(), SigningError> {
+    info!("Initiating Round 2: Generating and broadcasting signature shares.");
     for signer in signers.values() {
         let nonce = &nonces[&signer.participant_id];
-        let share = frost::round2::sign_with_tweak(signing_package, nonce, &signer.key_package, None)?;
-        shares.insert(signer.participant_id, share);
+        signer.sign_and_broadcast_share(nonce).await?;
     }
-    Ok(shares)
+    Ok(())
+}
+
+/// Waits for and processes signature shares.
+async fn collect_shares(
+    transport: Arc<InMemoryTransport>,
+    signers: &HashMap<Identifier, FrostSigner>,
+) -> Result<BTreeMap<Identifier, frost::round2::SignatureShare>, SigningError> {
+    info!("Collecting signature shares from all participants.");
+
+    let deadline = signers
+        .values()
+        .find_map(|s| match s.get_state().ok()? {
+            SigningState::CollectingShares { deadline, .. } => Some(deadline),
+            _ => None,
+        })
+        .ok_or_else(|| SigningError::InvalidState("Signers not in share collection state.".to_string()))?;
+
+    // Drain the message queue until the deadline is hit or the queue is empty
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining_time = deadline - now;
+
+        match timeout(remaining_time, transport.receive()).await {
+            Ok(Ok(Some((_, message)))) => {
+                for signer in signers.values() {
+                    signer.process_message(message.clone()).await?;
+                }
+            }
+            // Channel closed or timeout, break and process what was received
+            Ok(Ok(None)) | Err(_) => {
+                break;
+            }
+            // Transport error
+            Ok(Err(e)) => return Err(e.into()),
+        }
+    }
+
+    // Extract the collected shares from any signer
+    signers
+        .values()
+        .find_map(|s| {
+            if let Ok(SigningState::CollectingShares { shares, .. }) = s.get_state() {
+                Some(shares)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| SigningError::InternalError("Could not retrieve shares.".to_string()))
 }

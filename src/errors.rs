@@ -1,7 +1,7 @@
 use frost_secp256k1_tr as frost;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum KeyDataError {
     #[error("Public key error: {0}")]
     PublicKey(String),
@@ -11,7 +11,7 @@ pub enum KeyDataError {
     JsonParse(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum SigningError {
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -38,7 +38,7 @@ pub enum SigningError {
     Bitcoin(#[from] BitcoinError),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum TransportError {
     #[error("Transport send error: {0}")]
     Send(String),
@@ -50,7 +50,7 @@ pub enum TransportError {
     Receive(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum BitcoinError {
     #[error("Sighash computation failed: {0}")]
     Sighash(String),

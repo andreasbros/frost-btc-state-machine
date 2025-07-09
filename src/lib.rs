@@ -2,10 +2,10 @@ pub mod bitcoin;
 pub mod errors;
 pub mod keys;
 pub mod signer;
-mod transport;
+pub mod transport;
 
 use crate::{
-    bitcoin::{broadcast_transaction, create_rpc_client, create_unsiged_transaction, fetch_utxo_to_spend, parse_utxo},
+    bitcoin::{broadcast_transaction, create_rpc_client, create_unsigned_transaction, fetch_utxo_to_spend, parse_utxo},
     keys::load_key_data,
     signer::run_signing_ceremony,
 };
@@ -15,6 +15,7 @@ use frost::keys::{generate_with_dealer, IdentifierList, KeyPackage};
 use frost_secp256k1_tr as frost;
 use keys::KeyData;
 use rand::rngs::OsRng;
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use std::{collections::BTreeMap, path::Path, str::FromStr};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::info;
@@ -55,7 +56,7 @@ pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
     let change_address = key_data.address(args.network).context("Failed to derive change address")?;
 
     let utxo_to_spend = fetch_utxo_to_spend(&rpc_client, &utxo)?;
-    let unsigned_transaction = create_unsiged_transaction(
+    let unsigned_transaction = create_unsigned_transaction(
         utxo,
         &utxo_to_spend,
         destination_address,
@@ -72,10 +73,14 @@ pub async fn spend(args: SpendArgs<'_>) -> Result<Txid, Error> {
     Ok(final_txid)
 }
 
-/// Generate threshold key shares (trusted dealer) and writes to the output file.
-pub async fn generate_keys(threshold: u16, total: u16, output: &Path) -> Result<(), Error> {
-    let rng = OsRng;
-    let (shares, pubkey_package) = generate_with_dealer(total, threshold, IdentifierList::Default, rng)?;
+pub async fn generate_keys(threshold: u16, total: u16, output: &Path, seed: Option<[u8; 32]>) -> Result<(), Error> {
+    let (shares, pubkey_package) = if let Some(seed_val) = seed {
+        let mut rng = ChaCha20Rng::from_seed(seed_val);
+        generate_with_dealer(total, threshold, IdentifierList::Default, &mut rng)?
+    } else {
+        let rng = OsRng;
+        generate_with_dealer(total, threshold, IdentifierList::Default, rng)?
+    };
 
     let key_packages = shares
         .into_iter()

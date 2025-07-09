@@ -8,36 +8,38 @@ use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness,
 };
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use frost_secp256k1_tr::{self as frost, Ciphersuite, Signature};
-use std::str::FromStr;
+use frost_secp256k1_tr::{
+    self as frost, round1::SigningCommitments, Ciphersuite, Identifier, Signature, SigningPackage,
+};
+use std::{collections::BTreeMap, str::FromStr};
 use tracing::{debug, warn};
 
 const DEFAULT_FEE: u64 = 500;
 const DUST_P2TR: u64 = 330;
 
 /// Create spend transaction
-pub fn create_unsiged_transaction(
+pub fn create_unsigned_transaction(
     utxo: OutPoint,
     utxo_to_spend: &TxOut,
     to_addr: Address,
-    pay_amount_sat: Amount,
+    pay_amount: Amount,
     change_addr: Address,
 ) -> Result<Transaction, BitcoinError> {
     let fee = Amount::from_sat(DEFAULT_FEE);
     let dust = Amount::from_sat(DUST_P2TR);
     let total_value = utxo_to_spend.value;
-    if pay_amount_sat + fee > total_value {
+    if pay_amount + fee > total_value {
         return Err(BitcoinError::Spend(format!(
-            "amount ({pay_amount_sat}) + fee ({DEFAULT_FEE}) exceeds utxo value ({total_value})"
+            "amount ({pay_amount}) + fee ({DEFAULT_FEE}) exceeds utxo value ({total_value})"
         )));
     }
 
     let tx_in =
         TxIn { previous_output: utxo, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() };
 
-    let pay_out = TxOut { value: pay_amount_sat, script_pubkey: to_addr.script_pubkey() };
+    let pay_out = TxOut { value: pay_amount, script_pubkey: to_addr.script_pubkey() };
 
-    let change_value = total_value - pay_amount_sat - fee;
+    let change_value = total_value - pay_amount - fee;
     let mut outputs = vec![pay_out];
 
     if change_value >= dust {
@@ -55,7 +57,7 @@ pub fn create_unsiged_transaction(
     })
 }
 
-/// Compute signature hash for segwit / taproot inputs.
+/// Compute signature hash for taproot inputs.
 pub fn compute_sighash(tx: &mut Transaction, prev_tx_outs: &[TxOut]) -> Result<Message, BitcoinError> {
     let mut sighasher = SighashCache::new(tx);
     let sighash = sighasher
@@ -63,6 +65,20 @@ pub fn compute_sighash(tx: &mut Transaction, prev_tx_outs: &[TxOut]) -> Result<M
         .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
 
     Ok(Message::from(sighash))
+}
+
+/// Creates the signing package, which includes the message to be signed (sighash).
+pub fn create_signing_package(
+    tx: &mut Transaction,
+    prev_tx_outs: &[TxOut],
+    commitments: BTreeMap<Identifier, SigningCommitments>,
+) -> Result<SigningPackage, BitcoinError> {
+    let sighash = compute_sighash(tx, prev_tx_outs)?;
+    debug!(
+        sighash = %hex::encode(sighash.as_ref()),
+        "Computed BIP-341 message digest for signing package."
+    );
+    Ok(SigningPackage::new(commitments, sighash.as_ref()))
 }
 
 /// Finalise transaction
@@ -88,7 +104,7 @@ pub fn create_rpc_client(url: &str, user: Option<&str>, pass: Option<&str>) -> R
         (Some(user), Some(pass)) => Auth::UserPass(user.to_string(), pass.to_string()),
         _ => Auth::None,
     };
-    Client::new(url, auth).map_err(|e| BitcoinError::Utxo(e.to_string()))
+    Client::new_with_minreq(url, auth).map_err(|e| BitcoinError::Utxo(e.to_string()))
 }
 
 /// Parses a UTXO string of the format "txid:vout" into an OutPoint.

@@ -13,12 +13,50 @@ FROST protocol is split into two sub-protocols:
 
 ## Separation of Concerns
 
+- FROST demo functions: `spend()` and `generate_keys()` are provided in `lib.rs`
+
 - Business logic: FrostSigner (signer.rs) contains the core business logic of the FROST protocol. It knows what to do when it receives 
     a SigningMessage (collect a commitment, store a share) and how to generate its own commitments and shares. It does 
     not know or care how these messages are sent / received other the network.
 
 - Networking abstraction: Transport trait (transport.rs) defines a contract for communication. The FrostSigner interacts with this 
   abstract interface and not a concrete network implementation. Concrete network implementation is provided in InMemoryTransport that simulates network in memory.
+
+## FROST State Machine
+
+### [signer.rs](signer.rs)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+
+    Idle --> CollectingCommitments: initiate_signing_round()
+
+    CollectingCommitments --> CollectingShares: advance_to_sharing_round()
+
+    CollectingShares --> Complete: complete_signing()
+
+    CollectingCommitments --> Failed: Not enough commitments
+    CollectingShares --> Failed: Not enough shares
+    Idle --> Failed: InvalidState
+    CollectingCommitments --> Failed: Invalid message
+    CollectingShares --> Failed: Invalid share or state
+
+    state CollectingCommitments {
+        [*] --> WaitingForCommitments
+        WaitingForCommitments --> TimeoutCommitments: deadline reached
+        WaitingForCommitments --> EnoughCommitments: threshold met
+    }
+
+    state CollectingShares {
+        [*] --> WaitingForShares
+        WaitingForShares --> TimeoutShares: deadline reached
+        WaitingForShares --> EnoughShares: threshold met
+    }
+
+    Complete --> [*]
+    Failed --> [*]
+```
 
 ## Observability and Metrics
 

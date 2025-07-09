@@ -15,16 +15,23 @@ FROST protocol is split into two sub-protocols:
 
 - FROST demo functions: `spend()` and `generate_keys()` are provided in `lib.rs`
 
-- Business logic: FrostSigner (signer.rs) contains the core business logic of the FROST protocol. It knows what to do when it receives 
+- Business logic: FrostSigner (`signer.rs`) contains the core business logic of the FROST protocol. It knows what to do when it receives 
     a SigningMessage (collect a commitment, store a share) and how to generate its own commitments and shares. It does 
     not know or care how these messages are sent / received other the network.
 
 - Networking abstraction: Transport trait (transport.rs) defines a contract for communication. The FrostSigner interacts with this 
   abstract interface and not a concrete network implementation. Concrete network implementation is provided in InMemoryTransport that simulates network in memory.
 
+- Bitcoin Network Function: Bitcoin utilities provided in `bitcoin.rs`
+
+- Tests: tests are broken down by:
+  - High level API / CLI
+  - State Machine
+  - FROST and Shnorr Taproot signature compatability
+
 ## FROST State Machine
 
-### [signer.rs](signer.rs)
+### [signer.rs](src/signer.rs)
 
 ```mermaid
 stateDiagram-v2

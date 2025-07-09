@@ -9,7 +9,6 @@ use crate::utils::test::TestHarness;
 
 #[tokio::test]
 async fn test_state_transition_idle_to_collecting_commitments() {
-    // --- Setup
     let harness = TestHarness::new(2, 3, None).await;
     let (signers, transport) = harness.create_signers();
     let signer = signers.values().next().unwrap();
@@ -48,7 +47,6 @@ async fn test_state_transition_idle_to_collecting_commitments() {
 
 #[tokio::test]
 async fn test_initiate_signing_in_invalid_state() {
-    // --- Setup
     let harness = TestHarness::new(2, 3, None).await;
     let (signers, _) = harness.create_signers();
     let signer = signers.values().next().unwrap();
@@ -63,7 +61,6 @@ async fn test_initiate_signing_in_invalid_state() {
     // Try to initiate again
     let result = signer.initiate_signing_round(session_id + 1, transaction).await;
 
-    // --- Assertions
     assert!(result.is_err());
     match result.err().unwrap() {
         SigningError::InvalidState(msg) => {

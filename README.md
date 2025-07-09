@@ -41,6 +41,13 @@ The application orchestrates the entire lifecycle of a threshold signature trans
 ## Architecture
 - See: [ARCHITECTURE.md](ARCHITECTURE.md)
 
+## CI/CD
+- Project is utilising GHA for CI pipeline: https://github.com/andreasbros/frost-btc-state-machine/actions
+  which:
+  - Runs rust format and syntax validation
+  - Compiles project
+  - Runs unit tests
+  - Builds final release binary
 
 ## Development environment setup
 
